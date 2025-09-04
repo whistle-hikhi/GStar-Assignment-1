@@ -53,6 +53,13 @@ These advanced stages implement important optimizations used in modern AI system
 ### Stage 8 : Sliding Window Attention (SWA) and Attention Sinks
 **File**: `problem_8.py` - Implement the GQA backward pass. Dive into autograd internals, recomputation, and memory-efficient backprop.
 
+## Research Challenge (Stage 9) (Optional): The Missing Piece for [GPT-OSS](https://cookbook.openai.com/articles/gpt-oss/fine-tune-transfomers) Finetuning
+**File** `problem_9.py` - This is a research-level (challenging) problem that addresses a real gap in today's ecosystem: enabling finetuning with Flash Attention when combined with Sliding Window and Attention Sinks.
+ince GPT-OSS release, people have not been able to finetune it with Flash Attention. OpenAI only provides the forward pass for inference. For training, the [OpenAI Cookbook](https://cookbook.openai.com/articles/gpt-oss/fine-tune-transfomers) and other resources fall back to naive attention, since the backward pass with Flash Attention is missing. Even official `flash_attn` library and related implementations currently lack support for finetuning with Flash Attention + Sliding Attention + Attention Sinks.
+
+**Your challenge**: If you can solve problem_8, you will have the foundation to attempt problem_9: implementing the missing backward pass for GPT-OSS finetuning.
+
+
 ## Prerequisites & Setup
 
 You'll need:
@@ -83,6 +90,7 @@ GStar/
 ├── problem_6.py             # Stage 6: Sliding Window Attention (YOUR CODE HERE)
 ├── problem_7.py             # Stage 7: Attention Sinks (YOUR CODE HERE)
 ├── problem_8.py             # Optional: GQA Backward Pass (BONUS CHALLENGE)
+├── problem_8.py             # Optional: GQA + SWDA + Attention Sinks Backward Pass (MORE CHALLENGE)
 ├── autograder.py            # Automated testing and benchmarking
 └── .gitignore              # Git ignore file
 ```
