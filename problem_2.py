@@ -16,10 +16,8 @@ def weighted_row_sum_kernel(
     """
     # 1. Get the row index for the current program instance
     row_idx = tl.program_id(axis=0)
-
     # 2. Pointer to the start of this row in X
     row_start_ptr = X_ptr + row_idx * N_COLS
-
     # 3. Pointer to the output element
     output_ptr = Y_ptr + row_idx
 
@@ -27,9 +25,9 @@ def weighted_row_sum_kernel(
     accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
     # 5. Loop over columns in chunks of BLOCK_SIZE
-    for col_block_start in range(0, N_COLS, BLOCK_SIZE):
+    for col_block_start in range(0, tl.cdiv(N_COLS, BLOCK_SIZE)):
         # Offsets for this block
-        col_offsets = col_block_start + tl.arange(0, BLOCK_SIZE)
+        col_offsets = col_block_start * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
 
         # Mask to stay in-bounds
         mask = col_offsets < N_COLS
