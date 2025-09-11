@@ -47,43 +47,52 @@ def _flash_attention_forward_causal_kernel(
 
     # --- Phase 1: Accumulate in Off-Diagonal Blocks (No Masking) ---
     # Process key/value blocks that are strictly in the past (q_idx > k_idx).
+
     for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
-        k_offsets = start_n + tl.arange(0, BLOCK_N)                     # (BLOCK_N,)
-        k_mask = k_offsets < SEQ_LEN                                    # (BLOCK_N,)
-
-        # Load K block: (BLOCK_N, HEAD_DIM)
+        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
+        # Implement the logic for the off-diagonal blocks.
+        # This is very similar to the non-causal version from Problem 3.
+        # 1. Load the K and V blocks for the current iteration.
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
         k_ptrs = K_ptr + batch_idx * k_stride_b + head_idx * k_stride_h + \
-                 (k_offsets[:, None] * k_stride_s + tl.arange(0, HEAD_DIM)[None, :])
-        k_block = tl.load(k_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
 
-        # Load V block: (BLOCK_N, HEAD_DIM)
         v_ptrs = V_ptr + batch_idx * v_stride_b + head_idx * v_stride_h + \
                  (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
-        v_block = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        # 2. Compute the attention scores (S_ij).
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+         # row-wise max in this tile
+        m_ij = tl.max(s_ij, axis=1)
 
-        # Compute S = Q @ K^T safely using broadcasting and sum (shape: BLOCK_M x BLOCK_N)
-        # Avoid using trans_b or uncertain transpose helpers.
-        S = tl.sum(q_block[:, None, :] * k_block[None, :, :], 2) * qk_scale
-        
-        # Mask out invalid K positions
-        mask = k_mask[None, :]  # (1, BLOCK_N) -> broadcast to (BLOCK_M, BLOCK_N)
-        S = tl.where(mask, S, -1e9)
+        # new running max
+        m_new = tl.maximum(m_i, m_ij)
 
-        # Online softmax update (stable)
-        s_max = tl.max(S, 1)                     # (BLOCK_M,)
-        m_new = tl.maximum(m_i, s_max)           # (BLOCK_M,)
+        # rescale previous accumulator/denominator
+        exp_m_diff = tl.exp2(m_i - m_new)   # [BLOCK_M]
+        acc = acc * exp_m_diff[:, None]     # [BLOCK_M, HEAD_DIM]
+        l_i = l_i * exp_m_diff              # [BLOCK_M]
 
-        p = tl.exp2(S - m_new[:, None])          # (BLOCK_M, BLOCK_N)
+        # compute probabilities
+        p_ij = tl.exp2(s_ij - m_new[:, None])  # [BLOCK_M, BLOCK_N]
 
-        exp_m_diff = tl.exp2(m_i - m_new)        # (BLOCK_M,)
-        l_new = l_i * exp_m_diff + tl.sum(p, 1)  # (BLOCK_M,)
+        # mask
+        k_mask = (k_offsets[None, :] < SEQ_LEN)  # [1, BLOCK_N]
+        p_ij = tl.where(k_mask, p_ij, 0.0)
 
-        # pv = p @ V_block  => (BLOCK_M, HEAD_DIM)
-        pv = tl.dot(p, v_block)
-        acc = acc * exp_m_diff[:, None] + pv
+        # weighted update
+        weighted_v = tl.dot(p_ij.to(tl.float32), v_block.to(tl.float32))
+        acc = acc + weighted_v
 
+        # denominator update
+        l_i = l_i + tl.sum(p_ij, axis=1)
+
+        # update running max
         m_i = m_new
-        l_i = l_new
+        # --- END OF STUDENT IMPLEMENTATION ---
 
     # Phase 2: Diagonal blocks (may overlap; apply causal mask)
     diag_start = q_block_idx * BLOCK_M
