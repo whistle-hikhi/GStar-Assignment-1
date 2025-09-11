@@ -36,7 +36,10 @@ def _flash_attention_forward_swa_kernel(
     # 1. Calculate the number of query heads per group.
     # 2. Determine the correct kv_head_idx for the current q_head_idx.
     
-    kv_head_idx = 0    # Placeholder: Replace with your GQA calculation
+    # Number of query heads served by each kv head (integer division; assert divides evenly in python wrapper)
+    q_heads_per_kv = N_Q_HEADS // N_KV_HEADS
+    # Map the q_head_idx to its corresponding kv head index
+    kv_head_idx = q_head_idx // q_heads_per_kv
     # --- END OF GQA IMPLEMENTATION ---
 
 
@@ -59,20 +62,86 @@ def _flash_attention_forward_swa_kernel(
     # 1. Calculate the starting position of the attention window (window_start).
     # 2. Modify the range of the Phase 1 loop to start from your window_start.
 
-    window_start = 0 # Placeholder: Replace with your SWA calculation
-
+    # For causal attention: each query at position i attends to keys in [max(0, i-WINDOW_SIZE+1), i]
+    # For the block at q_block_idx, the highest query position in the block is (q_block_idx*BLOCK_M + BLOCK_M - 1)
+    # We compute the earliest key position any query in this block could attend to, then align it down to BLOCK_N
+    max_query_pos = q_block_idx * BLOCK_M + (BLOCK_M - 1)
+    earliest_key_pos = max_query_pos - (WINDOW_SIZE - 1)
+    if earliest_key_pos < 0:
+        earliest_key_pos = 0
+    # Align to BLOCK_N boundary (start of a key-block)
+    window_start = (earliest_key_pos // BLOCK_N) * BLOCK_N
     # --- Phase 1: Off-Diagonal Blocks (within the window) ---
     for start_n in range(window_start, q_block_idx * BLOCK_M, BLOCK_N):
         # STUDENT IMPLEMENTATION REQUIRED (Part 3: SWA Logic)
         # Hint: You might need to apply the per-element sliding window mask to s_ij.
         #    - A score is invalid if `(query_offset - key_offset) >= WINDOW_SIZE`.
-        pass
+        # Build key offsets for this key block
+        k_offsets = (start_n + tl.arange(0, BLOCK_N))
+        # Ptrs for K and V using the kv_head_idx computed above
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[:, None] * k_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        k_block = tl.load(k_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # Compute raw scores: (BLOCK_M x HEAD_DIM) @ (HEAD_DIM x BLOCK_N) -> (BLOCK_M x BLOCK_N)
+        s = tl.dot(q_block, k_block, trans_b=True) * qk_scale  # shape [BLOCK_M, BLOCK_N]
+
+        # Build mask for valid positions:
+        # causal: key_pos <= query_pos  -> (q_offset - k_offset) >= 0
+        # sliding window: (q_offset - k_offset) < WINDOW_SIZE
+        # also ensure key_pos < SEQ_LEN and query_pos < SEQ_LEN (query mask done on load)
+        rel = (q_offsets[:, None] - k_offsets[None, :])  # shape [BLOCK_M, BLOCK_N]
+        valid_mask = (rel >= 0) & (rel < WINDOW_SIZE) & (k_offsets[None, :] < SEQ_LEN)
+
+        # For invalid positions set score to -inf to ignore them in softmax
+        s = tl.where(valid_mask, s, -float('inf'))
+
+        # Numerically stable softmax accumulation (online)
+        s_max = tl.max(s, axis=1)  # shape [BLOCK_M]
+        m_new = tl.maximum(m_i, s_max)
+        exp_s = tl.exp(s - m_new[:, None])
+        l_new = tl.exp(m_i - m_new) * l_i + tl.sum(exp_s, axis=1)
+        # update acc: acc * exp(m_i - m_new) + exp_s @ v_block
+        # compute exp_s @ v_block (shape [BLOCK_M, HEAD_DIM])
+        weighted_vals = tl.dot(exp_s, v_block)  # uses exp_s (BLOCK_M x BLOCK_N) & v_block (BLOCK_N x HEAD_DIM)
+        acc = acc * tl.exp(m_i - m_new)[:, None] + weighted_vals
+
+        # commit updated m_i and l_i
+        m_i = m_new
+        l_i = l_new
 
     # --- Phase 2: Diagonal Blocks ---
     diag_start = q_block_idx * BLOCK_M
     for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
-        # STUDENT IMPLEMENTATION REQUIRED
-        pass
+        # Diagonal blocks: keys and queries from roughly the same block.
+        k_offsets = (start_n + tl.arange(0, BLOCK_N))
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[:, None] * k_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        k_block = tl.load(k_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        s = tl.dot(q_block, k_block, trans_b=True) * qk_scale  # [BLOCK_M, BLOCK_N]
+
+        # For diagonal, enforce causal per-element: key_pos <= query_pos
+        rel = (q_offsets[:, None] - k_offsets[None, :])
+        valid_mask = (rel >= 0) & (rel < WINDOW_SIZE) & (k_offsets[None, :] < SEQ_LEN)
+
+        s = tl.where(valid_mask, s, -float('inf'))
+
+        # Numerically stable softmax accumulation (online) same as above
+        s_max = tl.max(s, axis=1)
+        m_new = tl.maximum(m_i, s_max)
+        exp_s = tl.exp(s - m_new[:, None])
+        l_new = tl.exp(m_i - m_new) * l_i + tl.sum(exp_s, axis=1)
+        weighted_vals = tl.dot(exp_s, v_block)
+        acc = acc * tl.exp(m_i - m_new)[:, None] + weighted_vals
+        m_i = m_new
+        l_i = l_new
     # --- END OF SWA IMPLEMENTATION ---
 
 

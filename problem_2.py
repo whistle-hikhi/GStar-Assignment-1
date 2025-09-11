@@ -14,51 +14,38 @@ def weighted_row_sum_kernel(
     Triton kernel to compute the weighted sum of each row in a matrix.
     Y[i] = sum_{j=0}^{N_COLS-1} X[i, j] * W[j]
     """
-    # 1. Get the row index for the current program instance.
-    #    Hint: Use tl.program_id(axis=0).
-    row_idx = ...
+    # 1. Get the row index for the current program instance
+    row_idx = tl.program_id(axis=0)
 
-    # 2. Create a pointer to the start of the current row in the input tensor X.
-    #    Hint: The offset depends on the row index and the number of columns (N_COLS).
-    row_start_ptr = ...
-    
-    # 3. Create a pointer for the output vector Y.
-    output_ptr = ...
+    # 2. Pointer to the start of this row in X
+    row_start_ptr = X_ptr + row_idx * N_COLS
 
-    # 4. Initialize an accumulator for the sum of the products for a block.
-    #    This should be a block-sized tensor of zeros.
-    #    Hint: Use tl.zeros with shape (BLOCK_SIZE,) and dtype tl.float32.
-    accumulator = ...
+    # 3. Pointer to the output element
+    output_ptr = Y_ptr + row_idx
 
-    # 5. Iterate over the columns of the row in blocks of BLOCK_SIZE.
-    #    Hint: Use a for loop with tl.cdiv(N_COLS, BLOCK_SIZE).
-    for col_block_start in range(0, ...):
-        # - Calculate the offsets for the current block of columns.
-        #   Hint: Start from the block's beginning and add tl.arange(0, BLOCK_SIZE).
-        col_offsets = ...
-        
-        # - Create a mask to prevent out-of-bounds memory access for the last block.
-        #   Hint: Compare col_offsets with N_COLS.
-        mask = ...
-        
-        # - Load a block of data from X and W safely using the mask.
-        #   Hint: Use tl.load with the appropriate pointers, offsets, and mask.
-        #   Use `other=0.0` to handle out-of-bounds elements.
-        x_chunk = tl.load(...)
-        w_chunk = tl.load(...)
-        
-        # - Compute the element-wise product and add it to the accumulator.
-        accumulator += ...
-        
-    # 6. Reduce the block-sized accumulator to a single scalar value after the loop.
-    #    Hint: Use tl.sum().
-    final_sum = ...
+    # 4. Initialize accumulator (block-sized)
+    accumulator = tl.zeros((BLOCK_SIZE,), dtype=tl.float32)
 
-    # 7. Store the final accumulated sum to the output tensor Y.
-    #    Hint: Use tl.store().
-    ...
-    
-# --- END OF STUDENT IMPLEMENTATION ---
+    # 5. Loop over columns in chunks of BLOCK_SIZE
+    for col_block_start in range(0, N_COLS, BLOCK_SIZE):
+        # Offsets for this block
+        col_offsets = col_block_start + tl.arange(0, BLOCK_SIZE)
+
+        # Mask to stay in-bounds
+        mask = col_offsets < N_COLS
+
+        # Load from X and W with masking
+        x_chunk = tl.load(row_start_ptr + col_offsets, mask=mask, other=0.0)
+        w_chunk = tl.load(W_ptr + col_offsets, mask=mask, other=0.0)
+
+        # Accumulate weighted product
+        accumulator += x_chunk * w_chunk
+
+    # 6. Reduce to scalar
+    final_sum = tl.sum(accumulator, axis=0)
+
+    # 7. Store result
+    tl.store(output_ptr, final_sum)
 
 
 def weighted_row_sum_forward(x: torch.Tensor, w: torch.Tensor) -> torch.Tensor:

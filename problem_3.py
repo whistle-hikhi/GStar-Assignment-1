@@ -21,7 +21,6 @@ def _flash_attention_forward_kernel(
 ):
     """
     Triton kernel for the forward pass of FlashAttention-2 (non-causal).
-    This is a template for student implementation.
     """
     # 1. Identify the block of queries and the batch/head to be processed.
     q_block_idx = tl.program_id(axis=0)
@@ -61,26 +60,42 @@ def _flash_attention_forward_kernel(
                  (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
         v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
 
-        # --- STUDENT IMPLEMENTATION REQUIRED HERE ---
-        # Implement the online softmax update logic.
-        # 1. Find the new running maximum (`m_new`).
-        # 2. Rescale the existing accumulator (`acc`) and denominator (`l_i`).
-        # 3. Compute the attention probabilities for the current tile (`p_ij`).
-        # 4. Update the accumulator `acc` using `p_ij` and `v_block`.
-        # 5. Update the denominator `l_i`.
-        # 6. Update the running maximum `m_i` for the next iteration.
-        pass
-        # --- END OF STUDENT IMPLEMENTATION ---
+        # ---------------- ONLINE SOFTMAX UPDATE ----------------
+        # row-wise max in this tile
+        m_ij = tl.max(s_ij, axis=1)
 
+        # new running max
+        m_new = tl.maximum(m_i, m_ij)
+
+        # rescale previous accumulator/denominator
+        exp_m_diff = tl.exp2(m_i - m_new)   # [BLOCK_M]
+        acc = acc * exp_m_diff[:, None]     # [BLOCK_M, HEAD_DIM]
+        l_i = l_i * exp_m_diff              # [BLOCK_M]
+
+        # compute probabilities
+        p_ij = tl.exp2(s_ij - m_new[:, None])  # [BLOCK_M, BLOCK_N]
+
+        # mask
+        k_mask = (k_offsets[None, :] < SEQ_LEN)  # [1, BLOCK_N]
+        p_ij = tl.where(k_mask, p_ij, 0.0)
+
+        # weighted update
+        weighted_v = tl.dot(p_ij.to(tl.float32), v_block.to(tl.float32))
+        acc = acc + weighted_v
+
+        # denominator update
+        l_i = l_i + tl.sum(p_ij, axis=1)
+
+        # update running max
+        m_i = m_new
+        # --------------------------------------------------------
 
     # 5. Normalize the accumulator and write the output block.
-    # This part is provided. It handles the final normalization and write-back.
     l_i_safe = l_i[:, None] + 1e-6
     acc = acc / l_i_safe
     
     o_ptrs = O_ptr + batch_idx * q_stride_b + head_idx * q_stride_h + \
              (q_offsets[:, None] * q_stride_s + tl.arange(0, HEAD_DIM)[None, :])
-             
     tl.store(o_ptrs, acc.to(O_ptr.dtype.element_ty), mask=q_offsets[:, None] < SEQ_LEN)
 
 def flash_attention_forward(q, k, v, is_causal=False):
