@@ -57,7 +57,109 @@ def _flash_attention_forward_swa_kernel(
     # 1. Phase 0: Sink blocks that are before the sliding window
     # 2. Phase 1: Off-Diagonal Blocks (within the window)
     # 3. Phase 2: Diagonal Blocks
-    pass
+
+    # The key insight: we need to process ALL key positions from 0 to the current query block,
+    # but apply the correct mask (sink OR sliding window) to each position.
+    # This is simpler than trying to separate into phases.
+    
+    # Process all off-diagonal blocks from 0 to the current query block
+    for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
+
+        # Compute attention scores
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        
+        # Apply the exact same mask as the reference: (sliding | sink) & causal
+        q_offsets_2d = q_offsets[:, None]
+        k_offsets_2d = k_offsets[None, :]
+        
+        # Reference mask logic:
+        # sliding = (col <= row) & (col >= row - (window_size - 1))
+        # sink = (col < sink_size) & (col <= row)
+        # combined = sliding | sink
+        
+        sliding_mask = (k_offsets_2d <= q_offsets_2d) & (k_offsets_2d >= q_offsets_2d - (WINDOW_SIZE - 1))
+        sink_mask = (k_offsets_2d < SINK_SIZE) & (k_offsets_2d <= q_offsets_2d)
+        combined_mask = sliding_mask | sink_mask
+        
+        # Apply sequence length mask
+        seq_mask = k_offsets_2d < SEQ_LEN
+        combined_mask = combined_mask & seq_mask
+        
+        s_ij = tl.where(combined_mask, s_ij, -1e9)
+        
+        # Update online softmax statistics
+        m_ij = tl.max(s_ij, axis=1)
+        m_new = tl.maximum(m_i, m_ij)
+        
+        exp_m_diff = tl.exp2(m_i - m_new)
+        acc = acc * exp_m_diff[:, None]
+        l_i = l_i * exp_m_diff
+        
+        p_ij = tl.exp2(s_ij - m_new[:, None])
+        p_ij = tl.where(seq_mask, p_ij, 0.0)
+        
+        weighted_v = tl.dot(p_ij.to(tl.float32), v_block.to(tl.float32))
+        acc = acc + weighted_v
+        
+        l_i = l_i + tl.sum(p_ij, axis=1)
+        m_i = m_new
+
+    # --- Phase 2: Diagonal Blocks ---
+    diag_start = q_block_idx * BLOCK_M
+    for start_n in range(diag_start, (q_block_idx + 1) * BLOCK_M, BLOCK_N):
+        k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_mask = k_offsets < SEQ_LEN
+
+        k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
+                 (k_offsets[:, None] * k_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        k_block = tl.load(k_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
+
+        v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
+                 (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
+
+        S = tl.sum(q_block[:, None, :] * k_block[None, :, :], 2) * qk_scale
+
+        # Apply the exact same mask as the reference: (sliding | sink) & causal
+        q_offsets_2d = q_offsets[:, None]
+        k_offsets_2d = k_offsets[None, :]
+        
+        # Reference mask logic:
+        # sliding = (col <= row) & (col >= row - (window_size - 1))
+        # sink = (col < sink_size) & (col <= row)
+        # combined = sliding | sink
+        
+        sliding_mask = (k_offsets_2d <= q_offsets_2d) & (k_offsets_2d >= q_offsets_2d - (WINDOW_SIZE - 1))
+        sink_mask = (k_offsets_2d < SINK_SIZE) & (k_offsets_2d <= q_offsets_2d)
+        combined_mask = sliding_mask | sink_mask
+        
+        # Apply sequence length mask
+        seq_mask = (k_offsets[None, :] < SEQ_LEN) & (k_mask[None, :])
+        combined_mask = combined_mask & seq_mask
+        S = tl.where(combined_mask, S, -1e9)
+
+        s_max = tl.max(S, 1)
+        m_new = tl.maximum(m_i, s_max)
+
+        p = tl.exp2(S - m_new[:, None])
+
+        exp_m_diff = tl.exp2(m_i - m_new)
+        l_new = l_i * exp_m_diff + tl.sum(p, 1)
+
+        pv = tl.dot(p, v_block)
+        acc = acc * exp_m_diff[:, None] + pv
+
+        m_i = m_new
+        l_i = l_new
     # --- END OF STUDENT IMPLEMENTATION ---
 
     # 4. Normalize and write the final output block.
