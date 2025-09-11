@@ -59,38 +59,45 @@ def _flash_attention_forward_gqa_kernel(
     for start_n in range(0, q_block_idx * BLOCK_M, BLOCK_N):
         # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 2) ---
         k_offsets = start_n + tl.arange(0, BLOCK_N)
-
         k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
-                 (k_offsets[:, None] * k_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+                 (k_offsets[None, :] * k_stride_s + tl.arange(0, HEAD_DIM)[:, None])
+        k_block = tl.load(k_ptrs, mask=k_offsets[None, :] < SEQ_LEN, other=0.0)
+
         v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
                  (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_offsets[:, None] < SEQ_LEN, other=0.0)
 
-        k_block = tl.load(k_ptrs, mask=(k_offsets[:, None] < SEQ_LEN), other=0.0)
-        v_block = tl.load(v_ptrs, mask=(k_offsets[:, None] < SEQ_LEN), other=0.0)
+        ## 2. Compute the attention scores (S_ij).
+        s_ij = tl.dot(q_block, k_block)
+        s_ij *= qk_scale
+        # 3. Update the online softmax statistics (m_i, l_i) and the accumulator (acc).
+         # row-wise max in this tile
+        m_ij = tl.max(s_ij, axis=1)
 
-        # compute scores and mask out invalid key positions
-        # cancel ln(2) factor locally if present in qk_scale
-        inv_ln2 = 1.0 / 1.44269504
-        scores = tl.dot(q_block, k_block.T) * qk_scale * inv_ln2  # [BLOCK_M, BLOCK_N]
+        # new running max
+        m_new = tl.maximum(m_i, m_ij)
 
-        valid_k = k_offsets < SEQ_LEN                     # [BLOCK_N]
-        neg_inf = -1e9
-        scores = tl.where(valid_k[None, :], scores, neg_inf)
+        # rescale previous accumulator/denominator
+        exp_m_diff = tl.exp2(m_i - m_new)   # [BLOCK_M]
+        acc = acc * exp_m_diff[:, None]     # [BLOCK_M, HEAD_DIM]
+        l_i = l_i * exp_m_diff              # [BLOCK_M]
 
-        # numerically-stable online softmax merge
-        s_max = tl.max(scores, axis=1)          # [BLOCK_M]
-        m_j = tl.maximum(m_i, s_max)            # [BLOCK_M]
+        # compute probabilities
+        p_ij = tl.exp2(s_ij - m_new[:, None])  # [BLOCK_M, BLOCK_N]
 
-        exp_mi_mj = tl.exp(m_i - m_j)                     # [BLOCK_M]
-        exp_scores = tl.exp(scores - m_j[:, None])        # [BLOCK_M, BLOCK_N]
-        l_new = exp_mi_mj * l_i + tl.sum(exp_scores, axis=1)
+        # mask
+        k_mask = (k_offsets[None, :] < SEQ_LEN)  # [1, BLOCK_N]
+        p_ij = tl.where(k_mask, p_ij, 0.0)
 
-        # exp_scores @ V_block via broadcast+sum
-        tmp = tl.sum(exp_scores[:, :, None] * v_block[None, :, :], axis=1)
-        acc = exp_mi_mj[:, None] * acc + tmp
+        # weighted update
+        weighted_v = tl.dot(p_ij.to(tl.float32), v_block.to(tl.float32))
+        acc = acc + weighted_v
 
-        m_i = m_j
-        l_i = l_new
+        # denominator update
+        l_i = l_i + tl.sum(p_ij, axis=1)
+
+        # update running max
+        m_i = m_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
     # --- Phase 2: Diagonal Blocks ---
@@ -102,39 +109,34 @@ def _flash_attention_forward_gqa_kernel(
         #    update from your solution to Problem 4.
         # --- STUDENT IMPLEMENTATION REQUIRED HERE (Part 3) ---
         k_offsets = start_n + tl.arange(0, BLOCK_N)
+        k_mask = k_offsets < SEQ_LEN
 
         k_ptrs = K_ptr + batch_idx * k_stride_b + kv_head_idx * k_stride_h + \
                  (k_offsets[:, None] * k_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        k_block = tl.load(k_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
+
         v_ptrs = V_ptr + batch_idx * v_stride_b + kv_head_idx * v_stride_h + \
                  (k_offsets[:, None] * v_stride_s + tl.arange(0, HEAD_DIM)[None, :])
+        v_block = tl.load(v_ptrs, mask=k_mask[:, None], other=0.0).to(tl.float32)
 
-        k_block = tl.load(k_ptrs, mask=(k_offsets[:, None] < SEQ_LEN), other=0.0)
-        v_block = tl.load(v_ptrs, mask=(k_offsets[:, None] < SEQ_LEN), other=0.0)
+        S = tl.sum(q_block[:, None, :] * k_block[None, :, :], 2) * qk_scale
 
-        # compute scores (cancel ln(2) factor locally)
-        inv_ln2 = 1.0 / 1.44269504
-        scores = tl.dot(q_block, k_block.T) * qk_scale * inv_ln2  # [BLOCK_M, BLOCK_N]
+        # Causal mask: allow k_pos <= q_pos
+        causal_mask = (k_offsets[None, :] <= q_offsets[:, None]) & (k_mask[None, :])
+        S = tl.where(causal_mask, S, -1e9)
 
-        # causal mask: allow k_pos <= q_pos
-        key_pos_row = k_offsets[None, :]   # [1, BLOCK_N]
-        q_pos_col = q_offsets[:, None]     # [BLOCK_M, 1]
-        valid_k = key_pos_row < SEQ_LEN
-        causal_mask = valid_k & (key_pos_row <= q_pos_col)
+        s_max = tl.max(S, 1)
+        m_new = tl.maximum(m_i, s_max)
 
-        neg_inf = -1e9
-        scores = tl.where(causal_mask, scores, neg_inf)
+        p = tl.exp2(S - m_new[:, None])
 
-        s_max = tl.max(scores, axis=1)
-        m_j = tl.maximum(m_i, s_max)
+        exp_m_diff = tl.exp2(m_i - m_new)
+        l_new = l_i * exp_m_diff + tl.sum(p, 1)
 
-        exp_mi_mj = tl.exp(m_i - m_j)
-        exp_scores = tl.exp(scores - m_j[:, None])
-        l_new = exp_mi_mj * l_i + tl.sum(exp_scores, axis=1)
+        pv = tl.dot(p, v_block)
+        acc = acc * exp_m_diff[:, None] + pv
 
-        tmp = tl.sum(exp_scores[:, :, None] * v_block[None, :, :], axis=1)
-        acc = exp_mi_mj[:, None] * acc + tmp
-
-        m_i = m_j
+        m_i = m_new
         l_i = l_new
         # --- END OF STUDENT IMPLEMENTATION ---
 
